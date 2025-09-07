@@ -1,0 +1,193 @@
+# =====Post Pandemic Remote wWork Helath Impact Jun 2025==============
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy import stats
+import statsmodels.api as sm
+
+#Set up a workign folder for outputs
+OUT = "capstone_outputs"
+os.makedirs(OUT, exist_ok=True)
+
+#1)Load and Clean
+
+df= pd.read_csv("C:\\Users\\kswee\\OneDrive\\Desktop\\MIS581\\Portfolio Project\\post_pandemic_remote_work_health_impact_2025.csv")
+df.columns=df.columns.str.strip()
+
+#Standardize text columns (stip)
+for c in df.select_dtypes(include="object").columns:
+    df[c] = df[c].astype(str).str.strip()
+
+# Ordinal Map for Burnout
+burnout_map = {"Low": 1, "Medium": 2, "High": 3}
+df["Burnout_Num"] = df["Burnout_Level"].map(burnout_map)
+
+#Binary outcomes for Mental Health: 1 = Any Condition, 0 = None
+df["Mental_Any"] = (df["Mental_Health_Status"].str.lower() !="none").astype(int)
+
+#Ensure Numeric dtpyes
+num_cols=["Age", "Hours_Per_Week", "Work_Life_Balance_Score", "Social_Isolation_Score", "Burnout_Num"]
+for c in num_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# 2) Descriptive Statistics 
+
+desc=df[["Age", "Hours_Per_Week", "Work_Life_Balance_Score", "Social_Isolation_Score", "Burnout_Num"]].describe().T
+desc["median"]=df[desc.index].median()
+desc = desc.rename(columns = {"count": "N", "mean": "M", "std":"SD", "min":"Min", "max":"Max"})
+desc_apa = desc[["N", "M", "SD", "Min", "25%", "50%", "75%", "Max", "Min", "median"]].round(2)
+desc_apa.to_csv(os.path.join(OUT, "Table_A1_Descriptives.csv"))
+
+#3) RQ1: ANOVA
+burnout_by_arr ={wa: grp["Burnout_Num"].dropna().values
+                 for wa, grp in df.groupby("Work_Arrangement")}
+groups = [arr for arr in burnout_by_arr.values() if len(arr) > 1]
+
+if len(groups) >= 2:
+    F_val, p_val = stats.f_oneway(*groups)
+else:
+    F_val, p_val = np.nan, np.nan
+
+
+#Effect Size (eta-squared)
+overall_mean = df["Burnout_Num"].mean()
+ss_between = sum(len(g) * (np.nanmean(g) - overall_mean)**2 for g in groups)
+ss_total = np.nansum((df["Burnout_Num"] - overall_mean)**2)
+eta_sq = ss_between/ss_total if ss_total > 0 else np.nan
+
+anova_table = pd.DataFrame({
+    "Test":["One-way ANOVA"],
+    "F":[F_val], "p":[p_val], "Eta_sq":[eta_sq]
+}).round(4)
+anova_table.to_csv(os.path.join(OUT,"Table_B1_ANOVA_Burnout_by_Workarrangment.csv"), index=False)
+
+#group means table
+group_means = (df.groupby("Work_Arrangement")["Burnout_Num"]
+               .agg(N="count", M="mean", SD="std")
+               .round(3)
+              )
+group_means.to_csv(os.path.join(OUT, "Table_B2_GroupMeans_Burnout_by_WorkArrangement.csv"))
+
+#Figure: Boxplot(APA: save as PNG)
+plt.figure()
+df.boxplot(column="Burnout_Num", by="Work_Arrangement")
+plt.title("Figure B1. Burnout (1–3) by Work Arrangement")
+plt.suptitle("")
+plt.xlabel("Work Arrangement")
+plt.ylabel("Burnout (1=Low, 3=High)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, "Figure_B1_Boxplot_Burnout_by_WorkArrangement.png"), dpi=300)
+plt.close()
+
+# 4) Spearm Correlation - Hours Vs Work-Life Balance
+rho, p_spear = stats.spearmanr(df["Hours_Per_Week"],
+                               df["Work_Life_Balance_Score"],
+                               nan_policy="omit")
+corr_table = pd.DataFrame({
+    "Variables":["Hours_Per_Week vs Work_Life_Balance_Score"],
+    "Spearman_rho":[rho], "p":[p_spear]
+}).round(4)
+corr_table.to_csv(os.path.join(OUT, "Table_C1_Spearman_Hours_vs_WLB.csv"), index=False)
+
+# Scatter Figure
+plt.figure()
+plt.scatter(df["Hours_Per_Week"], df["Work_Life_Balance_Score"], alpha=0.3)
+plt.title("Figure C1. Hours per Week vs Work-Life Balance Score")
+plt.xlabel("Hours Per Week")
+plt.ylabel("Work-Life Balance (1–5)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT, "Figure_C1_Scatter_Hours_vs_WLB.png"), dpi=300)
+plt.close()
+
+# 5) RQ3: Logistic Regression - Any Mental Condition Predictors: Burnout_Num, Social_Isolation_Score, Hours, Work_Arrangement
+dummies = pd.get_dummies(df["Work_Arrangement"], prefix="WA", drop_first=True)
+logit_df = pd.concat([df[["Mental_Any","Burnout_Num","Social_Isolation_Score","Hours_Per_Week"]],
+                      dummies], axis=1).dropna()
+
+logit_note = None
+if logit_df["Mental_Any"].nunique() == 2 and len(logit_df) > 50:
+    X = sm.add_constant(logit_df.drop(columns=["Mental_Any"]))
+    y = logit_df["Mental_Any"]
+    logit_model = sm.Logit(y, X).fit(disp=False)
+
+    # Coefficients + p-values
+    coef = logit_model.params.rename("B")
+    se = logit_model.bse.rename("SE")
+    z  = (coef / se).rename("z")
+    p  = logit_model.pvalues.rename("p")
+    coef_table = pd.concat([coef, se, z, p], axis=1).round(4)
+    coef_table.to_csv(os.path.join(OUT, "Table_D1_Logit_Coefficients.csv"))
+
+    # Odds ratios with 95% CI
+    ci = logit_model.conf_int()
+    ci.columns = ["CI_Lower","CI_Upper"]
+    or_table = pd.concat([
+        np.exp(coef).rename("Odds_Ratio"),
+        np.exp(ci["CI_Lower"]).rename("CI_Lower"),
+        np.exp(ci["CI_Upper"]).rename("CI_Upper")
+    ], axis=1).round(3)
+    or_table.to_csv(os.path.join(OUT, "Table_D2_Logit_OddsRatios.csv"))
+else:
+    logit_note = "Logistic regression not run due to insufficient variation or sample size."
+    pd.DataFrame({"note":[logit_note]}).to_csv(os.path.join(OUT, "Table_D1_Logit_NOTE.csv"), index=False)
+
+# 6) RQ4: Work-Life Balance by Gender (t-test) & by Region (ANOVA)
+mask = df["Gender"].isin(["Male","Female"])
+male = df.loc[mask & (df["Gender"]=="Male"), "Work_Life_Balance_Score"].dropna()
+female = df.loc[mask & (df["Gender"]=="Female"), "Work_Life_Balance_Score"].dropna()
+
+if len(male) > 2 and len(female) > 2:
+    t_val, p_val = stats.ttest_ind(male, female, equal_var=False, nan_policy="omit")
+    t_table = pd.DataFrame({
+        "Comparison":["Male vs Female"], "t":[t_val], "p":[p_val],
+        "Male_mean":[male.mean()], "Female_mean":[female.mean()],
+        "Male_SD":[male.std()], "Female_SD":[female.std()],
+        "Male_N":[male.shape[0]], "Female_N":[female.shape[0]]
+    }).round(4)
+else:
+    t_table = pd.DataFrame({"note":["Insufficient male/female counts for t-test."]})
+t_table.to_csv(os.path.join(OUT, "Table_E1_Ttest_WLB_by_Gender.csv"), index=False)
+
+# ANOVA by Region
+region_groups = [g.dropna().values for _, g in df.groupby("Region")["Work_Life_Balance_Score"]]
+if len(region_groups) >= 2 and all(len(g)>1 for g in region_groups):
+    F_reg, p_reg = stats.f_oneway(*region_groups)
+    region_table = pd.DataFrame({"Test":["One-way ANOVA (Region)"], "F":[F_reg], "p":[p_reg]}).round(4)
+else:
+    region_table = pd.DataFrame({"note":["Insufficient region group sizes for ANOVA."]})
+region_table.to_csv(os.path.join(OUT, "Table_E2_ANOVA_WLB_by_Region.csv"), index=False)
+
+if "note" not in region_table.columns:
+    wlb_region = df.groupby("Region")["Work_Life_Balance_Score"].mean().sort_values()
+    plt.figure(figsize=(8,4))
+    wlb_region.plot(kind="bar")
+    plt.title("Figure E1. Mean Work-Life Balance by Region")
+    plt.xlabel("Region")
+    plt.ylabel("Work-Life Balance (1–5)")
+    for i, v in enumerate(wlb_region.values):
+        plt.text(i, v + 0.02, f"{v:.2f}", ha='center', va='bottom', fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT, "Figure_E1_Bar_WLB_by_Region.png"), dpi=300)
+    plt.close()
+
+# 7) Convenience printout of key stats (helps when writing)
+print("N =", df.shape[0])
+print("\nDescriptives (means):")
+print(df[["Age","Hours_Per_Week","Work_Life_Balance_Score",
+          "Social_Isolation_Score","Burnout_Num"]].mean().round(2))
+
+print("\nANOVA Burnout by Work Arrangement:", anova_table.to_dict("records"))
+print("\nSpearman Hours vs WLB:", corr_table.to_dict("records"))
+
+if logit_note:
+    print("\nLOGIT:", logit_note)
+else:
+    print("\nLOGIT Coefs (head):")
+    print(coef_table.head())
+
+print("\nWelch t-test WLB by Gender:")
+print(t_table)
+
+if "note" not in region_table.columns:
+    print("\nANOVA WLB by Region:", region_table.to_dict("records"))
